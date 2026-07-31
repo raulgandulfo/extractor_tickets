@@ -1,19 +1,30 @@
-import streamlit as st
-import google.generativeai as genai
-import pandas as pd
-import json
 import io
+import json
+import os
 import time
 from datetime import datetime
+
+import google.generativeai as genai
+import pandas as pd
+import streamlit as st
+from dotenv import load_dotenv
 
 # --- CONFIGURACION ---
 st.set_page_config(page_title="Extractor Tickets", layout="wide")
 st.title("📸 Extractor de TICKETS a Formato ARCA")
 
-GENAI_API_KEY = "AIzaSyDEutn4_ToWrk200DxAT1EygH9pNMre6is"
+load_dotenv()
+GENAI_API_KEY = os.environ.get("GEMINI_API_KEY")
+if not GENAI_API_KEY:
+    st.error("Falta GEMINI_API_KEY. Cargala en el archivo .env de la app.")
+    st.stop()
 genai.configure(api_key=GENAI_API_KEY)
 
-def extraer_datos_gemini(imagen):
+if "cola" not in st.session_state:
+    st.session_state.cola = []  # lista de dicts: {"nombre": str, "bytes": bytes}
+
+
+def extraer_datos_gemini(imagen_bytes):
     model = genai.GenerativeModel('gemini-flash-latest')
     prompt = """
     Analiza este comprobante de Argentina. Extrae los datos y responde UNICAMENTE con un JSON:
@@ -34,23 +45,24 @@ def extraer_datos_gemini(imagen):
     }
     Si es Factura B, calcula el neto e iva (total / 1.21).
     """
-    img = {"mime_type": "image/jpeg", "data": imagen.getvalue()}
+    img = {"mime_type": "image/jpeg", "data": imagen_bytes}
     response = model.generate_content([prompt, img])
     return json.loads(response.text.replace("```json", "").replace("```", "").strip())
+
 
 def armar_fila_arca(datos):
     tasa = datos.get("tasa_iva", 0.0)
     neto = float(datos.get("neto", 0.0) or 0.0)
     iva = float(datos.get("iva_monto", 0.0) or 0.0)
-    
+
     neto_21, iva_21 = (neto, iva) if tasa == 21.0 else (0.0, 0.0)
     neto_105, iva_105 = (neto, iva) if tasa == 10.5 else (0.0, 0.0)
     neto_27, iva_27 = (neto, iva) if tasa == 27.0 else (0.0, 0.0)
-    
+
     fecha_val = datos.get("fecha")
     try:
         fecha_str = datetime.strptime(fecha_val, "%Y-%m-%d").strftime("%d/%m/%Y") if fecha_val else ""
-    except:
+    except Exception:
         fecha_str = fecha_val or ""
 
     letra = str(datos.get("letra", "")).lower()
@@ -69,7 +81,7 @@ def armar_fila_arca(datos):
         "Número Desde": datos.get("nro") or 0,
         "Número Hasta": datos.get("nro") or 0,
         "Cód. Autorización": "",
-        "Tipo Doc. Emisor": "80", 
+        "Tipo Doc. Emisor": "80",
         "Nro. Doc. Emisor": datos.get("cuit") or "",
         "Denominación Emisor": datos.get("razon_social") or "",
         "Tipo Cambio": 1.0,
@@ -90,35 +102,65 @@ def armar_fila_arca(datos):
         "Op. Exentas": 0.0,
         "Otros Tributos": float(datos.get("percepcion", 0.0) or 0.0),
         "Total IVA": iva,
-        "Imp. Total": float(datos.get("total", 0.0) or 0.0)
+        "Imp. Total": float(datos.get("total", 0.0) or 0.0),
     }
 
+
 # --- INTERFAZ ---
-uploaded_files = st.file_uploader("Subí tus tickets", type=['jpg', 'jpeg', 'png'], accept_multiple_files=True)
+st.caption(
+    "Desde el celular: tocá 'Browse files' y elegí **Cámara** para sacar la foto con la app "
+    "nativa (más nítida). También podés elegir varias fotos ya guardadas en la galería."
+)
+uploaded_files = st.file_uploader(
+    "Agregar tickets", type=['jpg', 'jpeg', 'png'], accept_multiple_files=True
+)
+if uploaded_files and st.button("➕ Agregar a la cola"):
+    for file in uploaded_files:
+        st.session_state.cola.append({"nombre": file.name, "bytes": file.getvalue()})
+    st.rerun()
 
-if uploaded_files and st.button("🚀 Procesar Lote"):
-    resultados = []
-    barra = st.progress(0)
-    
-    for i, file in enumerate(uploaded_files):
-        try:
-            datos = extraer_datos_gemini(file)
-            resultados.append(armar_fila_arca(datos))
-            time.sleep(1) # Pequeña pausa para no saturar la cuota de la API
-        except Exception as e:
-            st.error(f"Error en {file.name}: {e}")
-        barra.progress((i + 1) / len(uploaded_files))
+# --- COLA ACUMULADA ---
+if st.session_state.cola:
+    st.subheader(f"Cola de tickets ({len(st.session_state.cola)})")
+    cols = st.columns(4)
+    for i, item in enumerate(st.session_state.cola):
+        with cols[i % 4]:
+            st.image(item["bytes"], caption=item["nombre"], use_container_width=True)
+            if st.button("🗑️ Quitar", key=f"quitar_{i}"):
+                st.session_state.cola.pop(i)
+                st.rerun()
 
-    if resultados:
-        df = pd.DataFrame(resultados)
-        output = io.BytesIO()
-        
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            # ACA ESTA LA MAGIA: Agregamos "la fila" genérica en la primera posición (A1)
-            pd.DataFrame([["Mis Comprobantes Recibidos"]]).to_excel(writer, index=False, header=False, startrow=0)
-            
-            # Y volcamos el DataFrame real a partir de la fila 2 (startrow=1)
-            df.to_excel(writer, index=False, header=True, startrow=1, sheet_name='Sheet1')
-        
-        st.success("¡Lote extraído exitosamente!")
-        st.download_button("📥 Descargar Excel para app1.py", output.getvalue(), "ARCA_TICKETS.xlsx")
+    col_a, col_b = st.columns(2)
+    procesar = col_a.button("🚀 Procesar Lote", type="primary")
+    if col_b.button("🧹 Vaciar cola"):
+        st.session_state.cola = []
+        st.rerun()
+
+    if procesar:
+        resultados = []
+        barra = st.progress(0)
+        total = len(st.session_state.cola)
+
+        for i, item in enumerate(st.session_state.cola):
+            try:
+                datos = extraer_datos_gemini(item["bytes"])
+                resultados.append(armar_fila_arca(datos))
+                time.sleep(1)  # Pequeña pausa para no saturar la cuota de la API
+            except Exception as e:
+                st.error(f"Error en {item['nombre']}: {e}")
+            barra.progress((i + 1) / total)
+
+        if resultados:
+            df = pd.DataFrame(resultados)
+            output = io.BytesIO()
+
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                pd.DataFrame([["Mis Comprobantes Recibidos"]]).to_excel(
+                    writer, index=False, header=False, startrow=0
+                )
+                df.to_excel(writer, index=False, header=True, startrow=1, sheet_name='Sheet1')
+
+            st.success("¡Lote extraído exitosamente!")
+            st.download_button("📥 Descargar Excel para app1.py", output.getvalue(), "ARCA_TICKETS.xlsx")
+else:
+    st.info("Todavía no agregaste tickets a la cola.")
